@@ -1,0 +1,28 @@
+# (서버) 파일 배치
+sudo mkdir -p /opt/localchat
+sudo tee /opt/localchat/app.py >/dev/null <<'PYCODE'
+# <<< 위 app.py 전체 붙여넣기 >>>
+PYCODE
+
+sudo tee /opt/localchat/install.sh >/dev/null <<'SHCODE'
+# <<< 위 install.sh 전체 붙여넣기 >>>
+SHCODE
+sudo chmod +x /opt/localchat/install.sh
+
+# 설치
+/opt/localchat/install.sh
+
+# 접속
+# 브라우저 -> http://<서버IP>:8000  → /setup 자동 이동 → 최초 관리자 계정 생성
+
+----------------------------------------------------------------------------------------------
+
+최초 계정 생성 후 /setup 차단: 사용자 수가 1명 이상이면 자동으로 로그인 페이지로만 이동합니다.
+
+username이 PK라 외부 연동/로그에서 식별이 깔끔합니다.
+
+백업 포인트: DB만 백업하면 사용자/메시지가 보존됩니다.
+
+확장: 동시접속 늘면 Nginx(리버스 프록시) + Redis message queue + 다중 프로세스로 확장 가능합니다.
+
+보안: 사내망 한정 운영 권장. 필요 시 Nginx TLS(사내CA)와 IP 허용 리스트 적용을 추천드립니다.
