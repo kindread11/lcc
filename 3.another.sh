@@ -10,9 +10,9 @@ DB_PASS=""        # 입력받음
 DB_PORT="3306"
 DB_ROOT_PASS=""   # 입력받음
 
-# 이미지 태그 (미리 빌드/푸시해둔 레지스트리 경로 사용)
-APP_IMAGE="myrepo/localchat-app:latest"
-DB_IMAGE="mariadb:11.4"
+# 이미지 태그 (미리 빌드/푸시해둔 레지스트리 경로)
+APP_IMAGE="kindread11/localchat-app"
+DB_IMAGE="kindread11/localchat-db11.4"
 
 _log(){ echo -e "\033[1;32m[INFO]\033[0m $*"; }
 _warn(){ echo -e "\033[1;33m[WARN]\033[0m $*"; }
