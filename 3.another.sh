@@ -215,7 +215,12 @@ write_backup_restore_scripts(){
 set -euo pipefail
 TS=$(date +%Y%m%d-%H%M%S)
 DUMP="/tmp/db-${TS}.sql.gz"
-mysqldump -h 127.0.0.1 -P ${DB_PORT} -u${DB_USER} -p${DB_PASS} ${DB_NAME} | gzip > "${DUMP}"
+
+# DB 컨테이너 내부에서 mysqldump 실행
+docker exec localchat-db mysqldump \
+  -u${DB_USER} -p${DB_PASS} ${DB_NAME} \
+  | gzip > "${DUMP}"
+
 aws s3 cp "${DUMP}" "${S3_BUCKET}/db-${TS}.sql.gz"
 aws s3 cp "${DUMP}" "${S3_BUCKET}/db-latest.sql.gz"
 rm -f "${DUMP}"
@@ -226,8 +231,12 @@ BKP
 #!/usr/bin/env bash
 set -euo pipefail
 TMP="/tmp/db-restore.sql.gz"
+
 aws s3 cp "${S3_BUCKET}/db-latest.sql.gz" "${TMP}"
-gunzip -c "${TMP}" | mysql -h 127.0.0.1 -P ${DB_PORT} -u${DB_USER} -p${DB_PASS} ${DB_NAME}
+# 컨테이너 내부에서 mysql 실행
+gunzip -c "${TMP}" \
+  | docker exec -i localchat-db \
+      mysql -u${DB_USER} -p${DB_PASS} ${DB_NAME}
 rm -f "${TMP}"
 RST
   chmod +x "${APP_DIR}/bin/restore-s3.sh"
