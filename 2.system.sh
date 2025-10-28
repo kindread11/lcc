@@ -1145,6 +1145,13 @@ initial_restore_if_exists(){
 
 write_backup_timer(){
   _log "systemd 타이머(30분) 생성"
+  # 백업 서비스가 참조하는 스크립트가 존재하는지 확인하고, 없으면 생성합니다.
+  if [ ! -f "${APP_DIR}/bin/backup-s3.sh" ]; then
+    _log "백업 스크립트 없음 - 생성 시도: ${APP_DIR}/bin/backup-s3.sh"
+    mkdir -p "${APP_DIR}/bin"
+    # write_backup_restore_scripts 함수가 파일을 생성하고 실행권한을 부여합니다.
+    write_backup_restore_scripts
+  fi
   cat > /etc/systemd/system/localchat-backup.service <<UNIT
 [Unit]
 Description=LocalChat DB S3 백업 실행
