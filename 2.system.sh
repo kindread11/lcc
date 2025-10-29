@@ -238,8 +238,7 @@ def init_db():
             conn.execute(text(
               "INSERT INTO rooms(room_key, room_name) VALUES "
               "('general','일반'),('devops','DevOps'),('random','잡담')"))
-}
-}
+        
 
 def users_count():
     with engine.begin() as conn:
