@@ -1,34 +1,35 @@
 #!/usr/bin/env bash
-# /opt/localchat/docker-bootstrap.sh
-# 목적: LocalChat를 Docker로 "완전 자동" 설치 (코드/이미지/Compose/방화벽/SELinux/systemd + S3 백업/복구)
 set -euo pipefail
 
-### ====== 설정 (필요시 변경) ======
 APP_DIR="/opt/localchat"
 APP_PORT="8000"
 
-# DB 컨테이너 사용 여부 (yes=compose에 MariaDB 포함)
 USE_LOCAL_DB_CONTAINER="yes"
 DB_NAME="localchat"
 DB_USER="DBADMIN"
-DB_PASS=""  # 이제 스크립트 실행 시 입력받음
-DB_PORT="3306"      # 컨테이너 내부 포트
-DB_ROOT_PASS=""     # 이제 스크립트 실행 시 입력받음
+DB_PASS=""
+DB_PORT="3306"
+DB_ROOT_PASS=""
 
-TRUST_PROXY="0"     # 리버스 프록시 뒤면
+TRUST_PROXY="0"
 NUM_PROXIES="1"
 
-### ====== 유틸 ======
+S3_BUCKET=""
+S3_REGION="ap-northeast-2"
+S3_AUTO_CREATE="no"
+S3_ENABLE_VERSIONING="no"
+S3_ENABLE_SSE="no"
+S3_LIFECYCLE_DAYS=""
+
 _is_cmd(){ command -v "$1" >/dev/null 2>&1; }
 _log(){ echo -e "\033[1;32m[INFO]\033[0m $*"; }
 _warn(){ echo -e "\033[1;33m[WARN]\033[0m $*"; }
 _err(){ echo -e "\033[1;31m[ERROR]\033[0m $*"; }
 
-require_root(){ [ "$(id -u)" -eq 0 ] || { _err "root로 실행하세요: sudo bash $0"; exit 1; }; }
+require_root(){ [ "$(id -u)" -eq 0 ] || { _err "root로 실행"; exit 1; }; }
 gen_secret(){ openssl rand -hex 16; }
 gen_password(){ tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16; echo; }
 
-# 비밀번호 입력 함수
 get_password_input(){
   local prompt="$1"
   local var_name="$2"
@@ -39,7 +40,7 @@ get_password_input(){
     read -s password; echo
     if [ -z "$password" ]; then
       eval "$var_name='Passw0rd!'"
-      _log "비밀번호가 입력되지 않아 기본값 Passw0rd! 로 설정되었습니다."
+      _log "비밀번호가 입력되지 않아 기본값 Passw0rd! 로 설정"
       break
     fi
     echo -n "비밀번호 확인: "
@@ -47,13 +48,13 @@ get_password_input(){
     if [ "$password" = "$password_confirm" ]; then
       if [ ${#password} -ge 8 ]; then
         eval "$var_name='$password'"
-        _log "비밀번호가 설정되었습니다."
+        _log "비밀번호가 설정됨"
         break
       else
-        _warn "비밀번호는 최소 8자 이상이어야 합니다."
+        _warn "비밀번호는 최소 8자 이상"
       fi
     else
-      _warn "비밀번호가 일치하지 않습니다. 다시 입력해주세요."
+      _warn "비밀번호 불일치. 재입력"
     fi
   done
 }
@@ -62,13 +63,13 @@ detect_pkg_mgr(){
   if _is_cmd dnf; then echo dnf
   elif _is_cmd yum; then echo yum
   elif _is_cmd apt; then echo apt
-  else _err "패키지 관리자(dnf/yum/apt) 미탐지"; exit 1
+  else _err "패키지 관리자 미탐지"; exit 1
   fi
 }
 
 install_prereqs(){
   local pm="$1"
-  _log "필수 패키지 설치 (python3, openssl, curl, awscli, jq)"
+  _log "필수 패키지 설치"
   case "$pm" in
     apt)
       apt -y update
@@ -76,12 +77,9 @@ install_prereqs(){
       ;;
     dnf|yum)
       $pm -y install python3 python3-pip openssl curl awscli jq || true
-      # 일부 배포판에서 awscli 패키지가 없을 수 있어 pip로 보조 설치
       if ! command -v aws >/dev/null 2>&1; then
-        _warn "awscli 패키지 미발견 → pip로 설치 시도(awscli v1)"
-        python3 -m pip install --upgrade awscli || {
-          _err "awscli 설치 실패"; exit 1;
-        }
+        _warn "awscli 없음 → pip 설치"
+        python3 -m pip install --upgrade awscli || { _err "awscli 설치 실패"; exit 1; }
       fi
       ;;
   esac
@@ -89,27 +87,20 @@ install_prereqs(){
 
 install_docker(){
   local pm="$1"
-
-  # 0) 선제 충돌 제거: EL 계열에서 podman-docker가 있으면 제거 (docker-ce 설치 시 필수)
   if rpm -q podman-docker >/dev/null 2>&1; then
-    _log "podman-docker 제거(도커 래퍼 충돌 방지)"
+    _log "podman-docker 제거"
     sudo dnf -y remove podman-docker docker || sudo yum -y remove podman-docker docker || true
   fi
-
-  # 1) Docker 존재 확인 (단, podman 래퍼일 수 있으므로 이후 분기에서 다시 판단)
   if _is_cmd docker && docker --version >/dev/null 2>&1; then
-    _log "Docker 이미 설치/사용 가능"
+    _log "Docker 이미 설치됨"
   else
     _log "Docker 설치 시도"
     case "$pm" in
       apt)
         sudo apt -y update
-        sudo apt -y install docker.io docker-compose-plugin || {
-          _warn "docker.io 설치 실패"
-        }
+        sudo apt -y install docker.io docker-compose-plugin || { _warn "docker.io 설치 실패"; }
         ;;
       dnf|yum)
-        # Docker CE 공식 리포 추가
         if ! $pm repolist 2>/dev/null | grep -qi docker-ce; then
           _log "Docker CE 리포 추가"
           if _is_cmd dnf; then
@@ -120,31 +111,27 @@ install_docker(){
             sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
           fi
         fi
-        # Docker CE 설치
         if ! sudo $pm -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
-          _warn "docker-ce 설치 실패 → Podman 경로로 전환 고려"
+          _warn "docker-ce 설치 실패"
         fi
         ;;
     esac
   fi
-
-  # 2) 서비스/소켓 활성화 분기
   if systemctl list-unit-files | grep -q '^docker\.service'; then
-    _log "docker.service 발견 – 활성화"
+    _log "docker.service 활성화"
     sudo systemctl enable --now docker
   elif docker --version 2>&1 | grep -qi 'podman'; then
     if systemctl list-unit-files | grep -q '^podman\.socket'; then
-      _warn "docker가 Podman 래퍼 – podman.socket 활성화"
+      _warn "docker가 Podman 래퍼 → podman.socket 활성화"
       sudo systemctl enable --now podman.socket
     else
-      _err "podman.socket 유닛이 없습니다. podman 패키지 설치가 필요합니다."
+      _err "podman.socket 없음"
       exit 1
     fi
   else
-    _warn "docker.service 없음 && podman 래퍼 아님 → docker-ce.repo 추가 후 설치 시도"
+    _warn "docker.service 없음"
     if command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
       pm_local="$(command -v dnf >/dev/null 2>&1 && echo dnf || echo yum)"
-      # docker-ce.repo 추가
       if ! $pm_local repolist 2>/dev/null | grep -qi docker-ce; then
         _log "Docker CE 리포 추가"
         if [ "$pm_local" = "dnf" ]; then
@@ -155,20 +142,19 @@ install_docker(){
           sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
         fi
       fi
-      # docker-ce 설치 시도
       if sudo $pm_local -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
         sudo systemctl enable --now docker
       else
-        _warn "docker-ce 설치 실패 → moby-engine 설치 시도"
+        _warn "docker-ce 실패 → moby-engine 시도"
         if sudo $pm_local -y install moby-engine moby-cli docker-compose-plugin; then
           sudo systemctl enable --now docker
         else
-          _err "docker-ce / moby-engine 모두 설치 실패"
+          _err "docker-ce / moby-engine 설치 실패"
           exit 1
         fi
       fi
     else
-      _err "EL 계열이 아니거나 dnf/yum 감지 실패"
+      _err "dnf/yum 없음"
       exit 1
     fi
   fi
@@ -201,7 +187,7 @@ TRUST_PROXY  = os.environ.get("TRUST_PROXY", "0") == "1"
 NUM_PROXIES  = int(os.environ.get("NUM_PROXIES", "1"))
 
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL env 가 필요합니다. 예) mysql+pymysql://user:pw@db:3306/localchat")
+    raise RuntimeError("DATABASE_URL env 필요. 예) mysql+pymysql://user:pw@db:3306/localchat")
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = SECRET_KEY
@@ -252,6 +238,7 @@ def init_db():
             conn.execute(text(
               "INSERT INTO rooms(room_key, room_name) VALUES "
               "('general','일반'),('devops','DevOps'),('random','잡담')"))
+        
 
 def users_count():
     with engine.begin() as conn:
@@ -435,7 +422,7 @@ const msg  = document.getElementById('msg');
 function addLine(text, cls){const d=document.createElement('div');d.className='msg '+(cls||'');d.textContent=text;chat.appendChild(d);chat.scrollTop=chat.scrollHeight;}
 socket.on('connect', ()=>{ socket.emit('join', {room}); });
 socket.on('sys',  d=> addLine(d.text));
-socket.on('chat', d=> addLine((d.user===username?'나':'['+d.user+']')+': '+d.text, d.user===username?'you':''));
+socket.on('chat', d=> addLine((d.user===username?'나':'['+d.user+']')+': '+d.text, d.user===username?'you':'')); 
 form.addEventListener('submit', e=>{
   e.preventDefault();
   const text=msg.value.trim(); if(!text) return;
@@ -490,8 +477,8 @@ def setup():
         flash("이미 초기 설정이 완료되었습니다."); return redirect(url_for("login"))
     if request.method == "POST":
         u = (request.form.get("username") or "").strip()
-        p = request.form.get("password") or ""
-        p2= request.form.get("password2") or ""
+        p = (request.form.get("password") or "")
+        p2= (request.form.get("password2") or "")
         if not re.fullmatch(r"[A-Za-z0-9._-]{3,32}", u):
             flash("아이디 형식이 올바르지 않습니다."); return render_template_string(TPL_SETUP)
         if len(p) < 8:
@@ -508,7 +495,6 @@ def setup():
 
 @app.route("/register", methods=["GET","POST"])
 def register():
-    # 최초 관리자 생성 단계에서는 가입 폼 노출 금지
     if users_count() == 0:
         return redirect(url_for("setup"))
 
@@ -525,18 +511,16 @@ def register():
 
     if request.method == "POST":
         u = (request.form.get("username") or "").strip()
-        p = request.form.get("password") or ""
-        p2= request.form.get("password2") or ""
+        p = (request.form.get("password") or "")
+        p2= (request.form.get("password2") or "")
         if not re.fullmatch(r"[A-Za-z0-9._-]{3,32}", u):
             flash("아이디 형식이 올바르지 않습니다."); return render_template_string(TPL_REGISTER)
         if len(p) < 8:
             flash("비밀번호는 8자 이상이어야 합니다."); return render_template_string(TPL_REGISTER)
         if p != p2:
             flash("비밀번호 확인이 일치하지 않습니다."); return render_template_string(TPL_REGISTER)
-        # 중복 방지
         if get_user(u):
             flash("이미 존재하는 아이디입니다."); return render_template_string(TPL_REGISTER)
-        # 생성: is_admin=0, is_active=0
         with engine.begin() as conn:
             conn.execute(text(
                 "INSERT INTO users(username, pw_hash, is_admin, is_active) VALUES(:u,:p,0,0)"
@@ -599,7 +583,6 @@ def admin_user_approve(username):
 @login_required
 @admin_required
 def admin_user_deactivate(username):
-    # 자기 자신(admin) 비활성화 방지(선택)
     if current_user.username == username:
         flash("자기 자신은 비활성화할 수 없습니다."); return redirect(url_for("admin_users"))
     with engine.begin() as conn:
@@ -611,7 +594,6 @@ def admin_user_deactivate(username):
 @login_required
 @admin_required
 def admin_user_delete(username):
-    # 최초 관리자/본인 보호(선택)
     if current_user.username == username:
         flash("자기 자신은 삭제할 수 없습니다."); return redirect(url_for("admin_users"))
     with engine.begin() as conn:
@@ -625,7 +607,7 @@ def login():
     if first_run: return redirect(url_for("setup"))
     if request.method=="POST":
         u = (request.form.get("username") or "").strip()
-        p = request.form.get("password") or ""
+        p = (request.form.get("password") or "")
         row = get_user(u)
         if row and check_password_hash(row["pw_hash"], p):
             if not row.get("is_active", True):
@@ -711,8 +693,10 @@ def admin_ip_allowlist():
             if "/" in pattern: ipaddress.ip_network(pattern, strict=False); ok = True
             else: ipaddress.ip_address(pattern); ok = True
         except ValueError: ok = False
-        if not ok: flash("패턴 형식이 올바르지 않습니다. 단일 IP 또는 CIDR(예: 10.0.0.0/24)로 입력하세요.")
-        else: add_allowed_pattern(pattern, note); flash("추가되었습니다.")
+        if not ok: 
+            flash("패턴 형식이 올바르지 않습니다. 단일 IP 또는 CIDR(예: 10.0.0.0/24)로 입력하세요.")
+        else: 
+            add_allowed_pattern(pattern, note); flash("추가되었습니다.")
     with engine.begin() as conn:
         rows = conn.execute(text("SELECT id, pattern, note, created_at FROM allowed_ips ORDER BY id")).all()
     return render_template_string(TPL_ADMIN_IP, title="관리자: 허용 IP", rows=rows, current_user=current_user)
@@ -783,9 +767,22 @@ CMD ["python", "app.py"]
 DOCKER
 }
 
+open_firewall(){
+  _log "방화벽 포트 개방 시도"
+  if systemctl is-active --quiet firewalld; then
+    firewall-cmd --add-port=${APP_PORT}/tcp --permanent || true
+    firewall-cmd --reload || true
+    _log "firewalld: ${APP_PORT}/tcp 허용"
+  elif _is_cmd ufw && ufw status | grep -q "Status: active"; then
+    ufw allow ${APP_PORT}/tcp || true
+    _log "ufw: ${APP_PORT}/tcp 허용"
+  else
+    _warn "firewalld/ufw 비활성. 필요 시 수동 개방"
+  fi
+}
+
 write_compose(){
   _log "docker-compose.yml 생성"
-  # DB 비밀번호 입력 받기
   if [ "${USE_LOCAL_DB_CONTAINER}" = "yes" ]; then
     echo
     _log "=== 데이터베이스 비밀번호 설정 ==="
@@ -853,7 +850,6 @@ services:
     container_name: localchat-app
     restart: unless-stopped
     environment:
-      # 외부 DB 주소로 교체하세요
       DATABASE_URL: "mysql+pymysql://USER:PASS@DBHOST:3306/localchat"
       LOCALCHAT_SECRET: "change-me"
       APP_HOST: "0.0.0.0"
@@ -863,20 +859,6 @@ services:
     ports:
       - "8000:8000"
 COMPOSE
-  fi
-}
-
-open_firewall(){
-  _log "방화벽 포트 개방 시도"
-  if systemctl is-active --quiet firewalld; then
-    firewall-cmd --add-port=${APP_PORT}/tcp --permanent || true
-    firewall-cmd --reload || true
-    _log "firewalld: ${APP_PORT}/tcp 허용"
-  elif _is_cmd ufw && ufw status | grep -q "Status: active"; then
-    ufw allow ${APP_PORT}/tcp || true
-    _log "ufw: ${APP_PORT}/tcp 허용"
-  else
-    _warn "firewalld/ufw 비활성. 필요 시 수동 개방"
   fi
 }
 
@@ -1012,16 +994,35 @@ PYCLIENT
   chmod +x "${APP_DIR}/chat_client.py"
 }
 
-### ====== AWS & S3 백업/복구 (추가) ======
+install_mysqldump_in_db(){
+  if [ "${USE_LOCAL_DB_CONTAINER}" = "yes" ]; then
+    _log "DB 컨테이너에 mysqldump 설치 확인"
+    if ! docker exec localchat-db which mysqldump >/dev/null 2>&1; then
+      _log "mysqldump 미발견 → mariadb-client 설치"
+      docker exec localchat-db bash -c "apt-get update && apt-get install -y mariadb-client" || {
+        _err "DB 컨테이너 내부 mariadb-client 설치 실패"
+        exit 1
+      }
+    else
+      _log "mysqldump 이미 설치됨"
+    fi
+  fi
+}
+
+### ====== AWS & S3 백업/복구 ======
 aws_login_env(){
   echo
   _log "=== AWS 자격 증명 입력 (파일에 저장하지 않음) ==="
-  read -rp "AWS Access Key ID: " AWS_AK
-  read -rsp "AWS Secret Access Key: " AWS_SK; echo
-  read -rp "AWS Region [ap-northeast-2]: " IN_RG
-  AWS_RG="${IN_RG:-ap-northeast-2}"
-  export AWS_ACCESS_KEY_ID="$AWS_AK"
-  export AWS_SECRET_ACCESS_KEY="$AWS_SK"
+  if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+    read -rp "AWS Access Key ID: " AWS_AK
+    read -rsp "AWS Secret Access Key: " AWS_SK; echo
+    export AWS_ACCESS_KEY_ID="$AWS_AK"
+    export AWS_SECRET_ACCESS_KEY="$AWS_SK"
+  else
+    _log "환경변수 AWS 자격 증명 사용"
+  fi
+  read -rp "AWS Region [${S3_REGION}]: " IN_RG
+  AWS_RG="${IN_RG:-${S3_REGION}}"
   export AWS_DEFAULT_REGION="$AWS_RG"
   if ! aws sts get-caller-identity >/dev/null 2>&1; then
     _err "AWS 인증 실패(키/리전 확인 필요)"
@@ -1029,33 +1030,67 @@ aws_login_env(){
     exit 1
   fi
   _log "AWS 인증 성공"
-  while :; do
-    read -rp "S3 버킷 이름 또는 경로(s3://bucket-name) 입력: " S3_IN
-    S3_IN="${S3_IN:-}"
-    [ -n "$S3_IN" ] || { _warn "빈 값입니다. 다시 입력하세요."; continue; }
-    case "$S3_IN" in
-      s3://*) S3_BUCKET="$S3_IN" ;;
-      *) S3_BUCKET="s3://${S3_IN}" ;;
+  local B_IN B_NAME
+  if [ -n "${S3_BUCKET}" ]; then
+    B_IN="${S3_BUCKET}"
+    case "$B_IN" in
+      s3://*) B_NAME="${B_IN#s3://}" ;;
+      *) B_NAME="${B_IN}" ;;
     esac
-    if aws s3 ls "$S3_BUCKET" >/dev/null 2>&1; then
-      _log "버킷 접근 확인: $S3_BUCKET"; break
+    _log "S3 버킷 지정: ${B_NAME}"
+  else
+    while :; do
+      read -rp "S3 버킷 이름 또는 경로(s3://bucket-name) 입력: " B_IN
+      B_IN="${B_IN:-}"
+      [ -n "$B_IN" ] || { _warn "빈 값입니다. 다시 입력하세요."; continue; }
+      case "$B_IN" in
+        s3://*) B_NAME="${B_IN#s3://}" ;;
+        *) B_NAME="${B_IN}" ;;
+      esac
+      break
+    done
+  fi
+  if aws s3api head-bucket --bucket "$B_NAME" >/dev/null 2>&1; then
+    _log "버킷 접근 확인: s3://${B_NAME}"
+  else
+    if [ "${S3_AUTO_CREATE}" = "yes" ]; then
+      _log "버킷 없음 → 자동 생성 실행: ${B_NAME} (${AWS_RG})"
+      if [ "${AWS_RG}" = "us-east-1" ]; then
+        aws s3api create-bucket --bucket "$B_NAME"
+      else
+        aws s3api create-bucket --bucket "$B_NAME" --create-bucket-configuration LocationConstraint="${AWS_RG}"
+      fi
+      if [ "${S3_ENABLE_SSE}" = "yes" ]; then
+        aws s3api put-bucket-encryption --bucket "$B_NAME" --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+      fi
+      if [ "${S3_ENABLE_VERSIONING}" = "yes" ]; then
+        aws s3api put-bucket-versioning --bucket "$B_NAME" --versioning-configuration Status=Enabled
+      fi
+      if [ -n "${S3_LIFECYCLE_DAYS}" ]; then
+        aws s3api put-bucket-lifecycle-configuration --bucket "$B_NAME" --lifecycle-configuration "{\"Rules\":[{\"ID\":\"localchat-backup-expire\",\"Status\":\"Enabled\",\"Filter\":{},\"Expiration\":{\"Days\":${S3_LIFECYCLE_DAYS}}}]}"
+      fi
+      aws s3api head-bucket --bucket "$B_NAME" >/dev/null 2>&1 || { _err "버킷 생성 확인 실패"; exit 1; }
+      _log "버킷 생성 완료: s3://${B_NAME}"
     else
-      _warn "버킷 접근 실패 또는 없음: $S3_BUCKET (권한/리전/이름 확인)"
+      _warn "버킷 접근 실패 또는 없음: s3://${B_NAME} (권한/리전/이름 확인). 자동 생성 비활성화 상태"
+      exit 1
     fi
-  done
-  export S3_BUCKET
+  fi
+  export S3_BUCKET="s3://${B_NAME}"
 }
 
 write_backup_restore_scripts(){
-  _log "백업/복구 스크립트 생성"
-  mkdir -p "${APP_DIR}/bin"
-
   cat > "${APP_DIR}/bin/backup-s3.sh" <<'BKP'
 #!/usr/bin/env bash
 set -euo pipefail
 TS=$(date +%Y%m%d-%H%M%S)
 DUMP="/tmp/db-${TS}.sql.gz"
-docker exec localchat-db sh -c "mysqldump -u${DB_USER} -p${DB_PASS} ${DB_NAME}" | gzip > "${DUMP}"
+
+# DB 컨테이너 내부에서 mysqldump 실행
+docker exec localchat-db mysqldump \
+  -u${DB_USER} -p${DB_PASS} ${DB_NAME} \
+  | gzip > "${DUMP}"
+
 aws s3 cp "${DUMP}" "${S3_BUCKET}/db-${TS}.sql.gz"
 aws s3 cp "${DUMP}" "${S3_BUCKET}/db-latest.sql.gz"
 rm -f "${DUMP}"
@@ -1066,8 +1101,11 @@ BKP
 #!/usr/bin/env bash
 set -euo pipefail
 TMP="/tmp/db-restore.sql.gz"
+
 aws s3 cp "${S3_BUCKET}/db-latest.sql.gz" "${TMP}"
-gunzip -c "${TMP}" | docker exec -i localchat-db sh -c "mysql -u${DB_USER} -p${DB_PASS} ${DB_NAME}"
+gunzip -c "${TMP}" \
+  | docker exec -i localchat-db \
+      mysql -u${DB_USER} -p${DB_PASS} ${DB_NAME}
 rm -f "${TMP}"
 RST
   chmod +x "${APP_DIR}/bin/restore-s3.sh"
@@ -1106,6 +1144,13 @@ initial_restore_if_exists(){
 
 write_backup_timer(){
   _log "systemd 타이머(30분) 생성"
+  # 백업 서비스가 참조하는 스크립트가 존재하는지 확인하고, 없으면 생성합니다.
+  if [ ! -f "${APP_DIR}/bin/backup-s3.sh" ]; then
+    _log "백업 스크립트 없음 - 생성 시도: ${APP_DIR}/bin/backup-s3.sh"
+    mkdir -p "${APP_DIR}/bin"
+    # write_backup_restore_scripts 함수가 파일을 생성하고 실행권한을 부여합니다.
+    write_backup_restore_scripts
+  fi
   cat > /etc/systemd/system/localchat-backup.service <<UNIT
 [Unit]
 Description=LocalChat DB S3 백업 실행
@@ -1175,12 +1220,13 @@ write_requirements
 write_dockerfile
 write_chat_client
 install_docker "${PM}"
-write_compose
 open_firewall
+write_compose
 selinux_hint
 compose_up
+install_mysqldump_in_db
 
-# === S3 백업/복구 추가 호출 순서 ===
+# === S3 백업/복구 ===
 aws_login_env
 write_backup_restore_scripts
 wait_db_ready
