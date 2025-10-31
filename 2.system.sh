@@ -1086,11 +1086,17 @@ set -euo pipefail
 TS=$(date +%Y%m%d-%H%M%S)
 DUMP="/tmp/db-${TS}.sql.gz"
 
-# DB 컨테이너 내부에서 mysqldump 실행
-docker exec localchat-db mysqldump \
-  -u${DB_USER} -p${DB_PASS} ${DB_NAME} \
-  | gzip > "${DUMP}"
+# DB 덤프: 컨테이너 내부에 mysqldump가 있으면 docker exec로, 없으면 임시 클라이언트 컨테이너로 수행
+if docker exec localchat-db which mysqldump >/dev/null 2>&1; then
+  docker exec localchat-db mysqldump -u"${DB_USER}" -p"${DB_PASS}" "${DB_NAME}" | gzip > "${DUMP}"
+else
+  # fallback: mariadb 이미지의 클라이언트를 사용하여 덤프 (localchat-db 컨테이너에 링크)
+  docker run --rm --link localchat-db:db mariadb:11.4 sh -c \
+    "exec mysqldump -h db -u\"${DB_USER}\" -p\"${DB_PASS}\" \"${DB_NAME}\"" \
+    | gzip > "${DUMP}"
+fi
 
+# S3 업로드
 aws s3 cp "${DUMP}" "${S3_BUCKET}/db-${TS}.sql.gz"
 aws s3 cp "${DUMP}" "${S3_BUCKET}/db-latest.sql.gz"
 rm -f "${DUMP}"
